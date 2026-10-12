@@ -38,6 +38,8 @@ import contextvars
 import hashlib
 import re
 import zlib
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
@@ -46,8 +48,6 @@ from fastapi import APIRouter, Request, Response
 
 from backlot import auth, sigv4, store, synth
 from backlot.openapi import qp
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 
 router = APIRouter(prefix="/s3", tags=["s3"])
 # A signed S3 request's canonical path is exact; letting Starlette 307-redirect a bare "/s3" ->
@@ -474,6 +474,7 @@ _CONFIGURATION_LISTS = {
 
 # --------------------------------------------------------------------------- helpers
 
+
 def _etag_matches(header_value: str, etag: str) -> bool:
     """Loose ETag match, as real S3 does it: comma list, optional W/ prefix,
     optional quotes, case-sensitive; '*' matches. Empty matches nothing."""
@@ -529,6 +530,7 @@ def _precondition(request, etag: str, last_modified: datetime):
             if d is not None and d <= now and last_modified <= d:
                 return ("304", None)
     return None
+
 
 def _xml(
     body: str,
@@ -1942,7 +1944,11 @@ async def object_get(request: Request, bucket: str, key: str):
     verdict = _precondition(request, etag.strip('"'), _http_date(last_modified))
     if verdict is not None:
         if _checksum_mode(request) == "invalid":
-            return _head(400) if head else _error("InvalidArgument", "The checksum mode header is invalid")
+            return (
+                _head(400)
+                if head
+                else _error("InvalidArgument", "The checksum mode header is invalid")
+            )
         kind, condition = verdict
         if kind == "304":
             # Only ETag and Last-Modified; the request-id pair comes from the /s3 middleware.

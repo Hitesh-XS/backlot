@@ -6183,47 +6183,38 @@ def test_object_conditional_headers(live_server):
     etag = original.headers["etag"]
     last_modified = original.headers["last-modified"]
 
-    last_modified_dt = datetime.strptime(
-        last_modified, "%a, %d %b %Y %H:%M:%S GMT"
-    ).replace(tzinfo=timezone.utc)
+    last_modified_dt = datetime.strptime(last_modified, "%a, %d %b %Y %H:%M:%S GMT").replace(
+        tzinfo=timezone.utc
+    )
 
-    old_date = (last_modified_dt - timedelta(days=1)).strftime(
+    old_date = (last_modified_dt - timedelta(days=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    future_date = (datetime.now(timezone.utc) + timedelta(days=1)).strftime(
         "%a, %d %b %Y %H:%M:%S GMT"
     )
-    future_date = (
-        datetime.now(timezone.utc) + timedelta(days=1)
-    ).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
     cases = [
         # If-None-Match match -> 304.
         ({"If-None-Match": etag}, 304, None),
-
         # If-Match mismatch -> 412.
         ({"If-Match": '"0000"'}, 412, "If-Match"),
-
         # If-Unmodified-Since before Last-Modified -> 412.
         ({"If-Unmodified-Since": old_date}, 412, "If-Unmodified-Since"),
-
         # If-Modified-Since older than Last-Modified -> ordinary 200.
         ({"If-Modified-Since": old_date}, 200, None),
-
         # A future If-Modified-Since is ignored.
         ({"If-Modified-Since": future_date}, 200, None),
-
         # If-Match takes precedence over If-Unmodified-Since.
         (
             {"If-Match": etag, "If-Unmodified-Since": old_date},
             200,
             None,
         ),
-
         # A failing If-Match takes precedence over If-None-Match.
         (
             {"If-Match": '"0000"', "If-None-Match": etag},
             412,
             "If-Match",
         ),
-
         # If-None-Match takes precedence over If-Modified-Since.
         (
             {"If-None-Match": etag, "If-Modified-Since": old_date},
@@ -6232,18 +6223,14 @@ def test_object_conditional_headers(live_server):
         ),
         # Equal Last-Modified date -> 304.
         ({"If-Modified-Since": last_modified}, 304, None),
-
         # Equal If-Unmodified-Since date -> 200.
         ({"If-Unmodified-Since": last_modified}, 200, None),
-
         # S3 behavior measured for this issue accepts these ETag forms.
         ({"If-None-Match": f"W/{etag}"}, 304, None),
         ({"If-None-Match": "*"}, 304, None),
         ({"If-None-Match": f'"0000", {etag}'}, 304, None),
-
         # A nonmatching validator does not produce 304.
         ({"If-None-Match": '"0000"'}, 200, None),
-
         # If-Match matching is case-sensitive.
         ({"If-Match": '"0000"'}, 412, "If-Match"),
     ]
@@ -6283,10 +6270,7 @@ def test_object_conditional_headers(live_server):
             elif expected_status == 412:
                 if method == "GET":
                     assert b"<Code>PreconditionFailed</Code>" in response.content
-                    assert (
-                        f"<Condition>{failed_condition}</Condition>".encode()
-                        in response.content
-                    )
+                    assert f"<Condition>{failed_condition}</Condition>".encode() in response.content
                 else:
                     assert response.content == b""
 
@@ -6313,7 +6297,10 @@ def _condition_rows(etag, lm):
     """(id, headers, query, status) measured on real S3, us-east-1, 2026-10-11 and 2026-10-12."""
     bare = etag.strip('"')
     lm_dt = datetime.strptime(lm, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
-    plus = lambda **kw: _http_fmt(lm_dt + timedelta(**kw))
+
+    def plus(**kw):
+        return _http_fmt(lm_dt + timedelta(**kw))
+
     return [
         ("inm-unquoted", {"If-None-Match": bare}, "", 304),
         ("inm-upper", {"If-None-Match": bare.upper()}, "", 200),
@@ -6372,17 +6359,21 @@ def test_object_conditionals_answer_as_real_s3_does(live_server):
     for row_id, headers, query, status in _condition_rows(etag, lm):
         path = f"{OBJECT_PATH}?{query}" if query else OBJECT_PATH
         for method in ("GET", "HEAD"):
-            r = _signed(
-                base_url, path, settings.admin_token, method=method, extra_headers=headers
-            )
+            r = _signed(base_url, path, settings.admin_token, method=method, extra_headers=headers)
             where = (row_id, method, r.text[:200])
             assert r.status_code == status, where
             if status == 304:
                 assert r.content == b"", where
                 assert r.headers["etag"] == etag and r.headers["last-modified"] == lm, where
-                for name in ("content-type", "content-length", "accept-ranges",
-                             "content-range", "x-amz-server-side-encryption",
-                             "x-amz-checksum-crc64nvme", "x-amz-checksum-type"):
+                for name in (
+                    "content-type",
+                    "content-length",
+                    "accept-ranges",
+                    "content-range",
+                    "x-amz-server-side-encryption",
+                    "x-amz-checksum-crc64nvme",
+                    "x-amz-checksum-type",
+                ):
                     assert name not in r.headers, (*where, name)
             elif status == 412:
                 if method == "GET":
