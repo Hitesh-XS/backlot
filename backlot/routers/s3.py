@@ -46,6 +46,8 @@ from fastapi import APIRouter, Request, Response
 
 from backlot import auth, sigv4, store, synth
 from backlot.openapi import qp
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 router = APIRouter(prefix="/s3", tags=["s3"])
 # A signed S3 request's canonical path is exact; letting Starlette 307-redirect a bare "/s3" ->
@@ -472,6 +474,61 @@ _CONFIGURATION_LISTS = {
 
 # --------------------------------------------------------------------------- helpers
 
+def _etag_matches(header_value: str, etag: str) -> bool:
+    """Loose ETag match, as real S3 does it: comma list, optional W/ prefix,
+    optional quotes, case-sensitive; '*' matches. Empty matches nothing."""
+    for part in header_value.split(","):
+        part = part.strip()
+        if part == "*":
+            return True
+        if part.startswith("W/"):
+            part = part[2:]
+        part = part.strip().strip('"')
+        if part and part == etag:
+            return True
+    return False
+
+
+def _http_date(value: str):
+    """Parse any of the three HTTP-date formats; None if unparseable (ignored)."""
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:  # asctime format carries no zone
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _precondition(request, etag: str, last_modified: datetime):
+    """Return ("412", condition_name), ("304", None) or None.
+    Order follows RFC 9110 section 13.2.2, which matches the measured rows."""
+    h = request.headers
+    if_match = h.get("if-match")
+    if if_match is not None:
+        if not _etag_matches(if_match, etag):
+            return ("412", "If-Match")
+    else:
+        since = h.get("if-unmodified-since")
+        if since is not None:
+            d = _http_date(since)
+            if d is not None and last_modified > d:
+                return ("412", "If-Unmodified-Since")
+
+    none_match = h.get("if-none-match")
+    if none_match is not None:
+        if _etag_matches(none_match, etag):
+            return ("304", None)
+    else:
+        since = h.get("if-modified-since")
+        if since is not None:
+            d = _http_date(since)
+            now = datetime.now(timezone.utc)
+            if d is not None and d <= now and last_modified <= d:
+                return ("304", None)
+    return None
 
 def _xml(
     body: str,
@@ -1875,6 +1932,32 @@ async def object_get(request: Request, bucket: str, key: str):
 
     data = row["content"].encode("utf-8")
     total = len(data)
+    ts = row["updated_ts"] or row["created_ts"]
+    etag = synth.s3_etag(row["key"], row["content"])
+    last_modified = synth.s3_http_date(ts)
+
+    # Conditional headers. Real S3 (us-east-1, 2026-10-11 and 2026-10-12) answers the 304 and the
+    # 412 ahead of the part-number refusal and the Range parse, GET and HEAD alike, but a bad
+    # checksum mode is refused ahead of both.
+    verdict = _precondition(request, etag.strip('"'), _http_date(last_modified))
+    if verdict is not None:
+        if _checksum_mode(request) == "invalid":
+            return _head(400) if head else _error("InvalidArgument", "The checksum mode header is invalid")
+        kind, condition = verdict
+        if kind == "304":
+            # Only ETag and Last-Modified; the request-id pair comes from the /s3 middleware.
+            return Response(
+                status_code=304,
+                headers={"ETag": etag, "Last-Modified": last_modified},
+            )
+        if head:
+            return _head(412)
+        return _error(
+            "PreconditionFailed",
+            "At least one of the pre-conditions you specified did not hold",
+            f"<Condition>{condition}</Condition>",
+        )
+
     if number is not None and number > 1:
         # Every object here is one part. The part is named as parsed, `02` as `2` (2026-09-29).
         if head:
@@ -1885,10 +1968,9 @@ async def object_get(request: Request, bucket: str, key: str):
             f"<PartNumberRequested>{number}</PartNumberRequested>"
             "<ActualPartCount>1</ActualPartCount>",
         )
-    ts = row["updated_ts"] or row["created_ts"]
     headers = {
-        "ETag": synth.s3_etag(row["key"], row["content"]),
-        "Last-Modified": synth.s3_http_date(ts),
+        "ETag": etag,
+        "Last-Modified": last_modified,
         "Accept-Ranges": "bytes",
         # SSE-S3, the default `_ANSWERED["encryption"]` declares, which real names on an object's
         # own 200 and 206, GET and HEAD alike (measured in us-east-1 on 2026-10-11).

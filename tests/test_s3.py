@@ -6172,3 +6172,248 @@ def test_a_prefix_or_marker_no_character_steps_past_is_a_page_not_a_500(
         r = _s3_get(big_bucket_client, f"/s3/encoded-bucket?{query}", token)
         assert r.status_code == 200, (query, r.status_code, r.text[:200])
         assert ET.fromstring(r.text).tag == f"{{{S3NS}}}ListBucketResult", query
+
+
+def test_object_conditional_headers(live_server):
+    """GET and HEAD honor the four S3 conditional headers."""
+    base_url, settings = live_server
+
+    # Read the validators from the ordinary response instead of hardcoding them.
+    original = _signed(base_url, OBJECT_PATH, settings.admin_token)
+    etag = original.headers["etag"]
+    last_modified = original.headers["last-modified"]
+
+    last_modified_dt = datetime.strptime(
+        last_modified, "%a, %d %b %Y %H:%M:%S GMT"
+    ).replace(tzinfo=timezone.utc)
+
+    old_date = (last_modified_dt - timedelta(days=1)).strftime(
+        "%a, %d %b %Y %H:%M:%S GMT"
+    )
+    future_date = (
+        datetime.now(timezone.utc) + timedelta(days=1)
+    ).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+    cases = [
+        # If-None-Match match -> 304.
+        ({"If-None-Match": etag}, 304, None),
+
+        # If-Match mismatch -> 412.
+        ({"If-Match": '"0000"'}, 412, "If-Match"),
+
+        # If-Unmodified-Since before Last-Modified -> 412.
+        ({"If-Unmodified-Since": old_date}, 412, "If-Unmodified-Since"),
+
+        # If-Modified-Since older than Last-Modified -> ordinary 200.
+        ({"If-Modified-Since": old_date}, 200, None),
+
+        # A future If-Modified-Since is ignored.
+        ({"If-Modified-Since": future_date}, 200, None),
+
+        # If-Match takes precedence over If-Unmodified-Since.
+        (
+            {"If-Match": etag, "If-Unmodified-Since": old_date},
+            200,
+            None,
+        ),
+
+        # A failing If-Match takes precedence over If-None-Match.
+        (
+            {"If-Match": '"0000"', "If-None-Match": etag},
+            412,
+            "If-Match",
+        ),
+
+        # If-None-Match takes precedence over If-Modified-Since.
+        (
+            {"If-None-Match": etag, "If-Modified-Since": old_date},
+            304,
+            None,
+        ),
+        # Equal Last-Modified date -> 304.
+        ({"If-Modified-Since": last_modified}, 304, None),
+
+        # Equal If-Unmodified-Since date -> 200.
+        ({"If-Unmodified-Since": last_modified}, 200, None),
+
+        # S3 behavior measured for this issue accepts these ETag forms.
+        ({"If-None-Match": f"W/{etag}"}, 304, None),
+        ({"If-None-Match": "*"}, 304, None),
+        ({"If-None-Match": f'"0000", {etag}'}, 304, None),
+
+        # A nonmatching validator does not produce 304.
+        ({"If-None-Match": '"0000"'}, 200, None),
+
+        # If-Match matching is case-sensitive.
+        ({"If-Match": '"0000"'}, 412, "If-Match"),
+    ]
+
+    for method in ("GET", "HEAD"):
+        for headers, expected_status, failed_condition in cases:
+            response = _signed(
+                base_url,
+                OBJECT_PATH,
+                settings.admin_token,
+                method=method,
+                extra_headers=headers,
+            )
+
+            assert response.status_code == expected_status, (
+                method,
+                headers,
+                response.text,
+            )
+
+            if expected_status == 304:
+                assert response.content == b""
+                assert response.headers["etag"] == etag
+                assert response.headers["last-modified"] == last_modified
+
+                # S3 does not send ordinary object-body headers on a 304.
+                for name in (
+                    "content-type",
+                    "content-length",
+                    "accept-ranges",
+                    "x-amz-server-side-encryption",
+                    "x-amz-checksum-crc64nvme",
+                    "x-amz-checksum-type",
+                ):
+                    assert name not in response.headers, (method, headers, name)
+
+            elif expected_status == 412:
+                if method == "GET":
+                    assert b"<Code>PreconditionFailed</Code>" in response.content
+                    assert (
+                        f"<Condition>{failed_condition}</Condition>".encode()
+                        in response.content
+                    )
+                else:
+                    assert response.content == b""
+
+            else:
+                assert response.headers["etag"] == etag
+                if method == "GET":
+                    assert response.content == original.content
+                else:
+                    assert response.content == b""
+
+
+def _http_fmt(dt, style="rfc1123"):
+    if style == "rfc850":
+        return dt.strftime("%A, %d-%b-%y %H:%M:%S GMT")
+    if style == "asctime":
+        return f"{dt:%a %b} {dt.day:2d} {dt:%H:%M:%S %Y}"
+    return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+_EPOCH = "Thu, 01 Jan 1970 00:00:00 GMT"
+
+
+def _condition_rows(etag, lm):
+    """(id, headers, query, status) measured on real S3, us-east-1, 2026-10-11 and 2026-10-12."""
+    bare = etag.strip('"')
+    lm_dt = datetime.strptime(lm, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+    plus = lambda **kw: _http_fmt(lm_dt + timedelta(**kw))
+    return [
+        ("inm-unquoted", {"If-None-Match": bare}, "", 304),
+        ("inm-upper", {"If-None-Match": bare.upper()}, "", 200),
+        ("inm-empty", {"If-None-Match": ""}, "", 200),
+        ("inm-list-unquoted", {"If-None-Match": f'"0000", {bare}'}, "", 304),
+        ("ims-plus-1s", {"If-Modified-Since": plus(seconds=1)}, "", 304),
+        ("ims-plus-3s", {"If-Modified-Since": plus(seconds=3)}, "", 304),
+        ("ims-rfc850", {"If-Modified-Since": _http_fmt(lm_dt, "rfc850")}, "", 304),
+        ("ims-asctime", {"If-Modified-Since": _http_fmt(lm_dt, "asctime")}, "", 304),
+        ("ims-day-earlier", {"If-Modified-Since": plus(days=-1)}, "", 200),
+        ("ims-2100", {"If-Modified-Since": "Fri, 01 Jan 2100 00:00:00 GMT"}, "", 200),
+        ("ims-garbage", {"If-Modified-Since": "garbage"}, "", 200),
+        ("ims-empty", {"If-Modified-Since": ""}, "", 200),
+        ("im-unquoted", {"If-Match": bare}, "", 200),
+        ("im-weak", {"If-Match": f"W/{etag}"}, "", 200),
+        ("im-star", {"If-Match": "*"}, "", 200),
+        ("im-list-unquoted", {"If-Match": f'"0000", {bare}'}, "", 200),
+        ("im-empty", {"If-Match": ""}, "", 412),
+        ("im-upper", {"If-Match": bare.upper()}, "", 412),
+        ("ius-1970", {"If-Unmodified-Since": _EPOCH}, "", 412),
+        ("ius-day-before", {"If-Unmodified-Since": plus(days=-1)}, "", 412),
+        ("ius-rfc850-1970", {"If-Unmodified-Since": "Thursday, 01-Jan-70 00:00:00 GMT"}, "", 412),
+        ("ius-plus-1s", {"If-Unmodified-Since": plus(seconds=1)}, "", 200),
+        ("ius-2100", {"If-Unmodified-Since": "Fri, 01 Jan 2100 00:00:00 GMT"}, "", 200),
+        ("ius-garbage", {"If-Unmodified-Since": "garbage"}, "", 200),
+        ("ius-empty", {"If-Unmodified-Since": ""}, "", 200),
+        # Two conditions at once.
+        ("im-bad+ius-met", {"If-Match": '"0000"', "If-Unmodified-Since": lm}, "", 412),
+        ("im-ok+ius-1970", {"If-Match": etag, "If-Unmodified-Since": _EPOCH}, "", 200),
+        ("im-ok+inm-etag", {"If-Match": etag, "If-None-Match": etag}, "", 304),
+        ("inm-other+ims-met", {"If-None-Match": '"0000"', "If-Modified-Since": lm}, "", 200),
+        # Ahead of the range and the part checks.
+        ("im-bad+range-unsat", {"If-Match": '"0000"', "Range": "bytes=100-200"}, "", 412),
+        ("inm-etag+range-unsat", {"If-None-Match": etag, "Range": "bytes=100-200"}, "", 304),
+        ("inm-etag+range-ok", {"If-None-Match": etag, "Range": "bytes=0-3"}, "", 304),
+        ("im-ok+range-ok", {"If-Match": etag, "Range": "bytes=0-3"}, "", 206),
+        ("im-bad+part2", {"If-Match": '"0000"'}, "partNumber=2", 412),
+        ("inm-etag+part2", {"If-None-Match": etag}, "partNumber=2", 304),
+        ("inm-etag+part1", {"If-None-Match": etag}, "partNumber=1", 304),
+        ("inm-other+part1", {"If-None-Match": '"0000"'}, "partNumber=1", 206),
+        ("inm-etag+vnull", {"If-None-Match": etag}, "versionId=null", 304),
+        ("im-bad+vnull", {"If-Match": '"0000"'}, "versionId=null", 412),
+        # Checksum mode: the 304 carries no checksum pair, and a good mode is no obstacle.
+        ("inm-etag+mode", {"If-None-Match": etag, "x-amz-checksum-mode": "ENABLED"}, "", 304),
+        ("im-bad+mode", {"If-Match": '"0000"', "x-amz-checksum-mode": "ENABLED"}, "", 412),
+    ]
+
+
+def test_object_conditionals_answer_as_real_s3_does(live_server):
+    """Each row on a GET and a HEAD, which real answered alike (s3.amazonaws.com, us-east-1,
+    2026-10-11 and 2026-10-12): the 304 carries the ETag and Last-Modified and nothing of the
+    object's body headers, the 412 names its condition, and the rest is the object's own answer."""
+    base_url, settings = live_server
+    plain = _signed(base_url, OBJECT_PATH, settings.admin_token)
+    etag, lm = plain.headers["etag"], plain.headers["last-modified"]
+    for row_id, headers, query, status in _condition_rows(etag, lm):
+        path = f"{OBJECT_PATH}?{query}" if query else OBJECT_PATH
+        for method in ("GET", "HEAD"):
+            r = _signed(
+                base_url, path, settings.admin_token, method=method, extra_headers=headers
+            )
+            where = (row_id, method, r.text[:200])
+            assert r.status_code == status, where
+            if status == 304:
+                assert r.content == b"", where
+                assert r.headers["etag"] == etag and r.headers["last-modified"] == lm, where
+                for name in ("content-type", "content-length", "accept-ranges",
+                             "content-range", "x-amz-server-side-encryption",
+                             "x-amz-checksum-crc64nvme", "x-amz-checksum-type"):
+                    assert name not in r.headers, (*where, name)
+            elif status == 412:
+                if method == "GET":
+                    assert r.headers["content-type"] == "application/xml", where
+                    assert "<Code>PreconditionFailed</Code>" in r.text, where
+                    assert "At least one of the pre-conditions you specified did not hold" in r.text
+
+                    # RFC 9110 precedence: If-Match is evaluated before If-Unmodified-Since
+                    if "im-bad" in row_id or "im-" in row_id:
+                        failed = "If-Match"
+                    elif "ius" in row_id:
+                        failed = "If-Unmodified-Since"
+                    else:
+                        failed = "If-Match"
+
+                    assert f"<Condition>{failed}</Condition>" in r.text, where
+                else:
+                    assert r.content == b"", where
+                    assert "content-length" not in r.headers, where
+                assert "x-amz-server-side-encryption" not in r.headers, where
+            else:
+                assert r.headers["etag"] == etag, where
+                assert r.headers["x-amz-server-side-encryption"] == "AES256", where
+
+
+@pytest.mark.parametrize("selector", ["tagging", "acl"])
+@pytest.mark.parametrize("condition", [{"If-Match": '"0000"'}, {"If-None-Match": "*"}])
+def test_a_condition_is_not_read_beside_an_objects_subresource(live_server, selector, condition):
+    """A key's `?tagging` and `?acl` answered 200 beside both conditions on real (2026-10-12)."""
+    base_url, settings = live_server
+    r = _signed(
+        base_url, f"{OBJECT_PATH}?{selector}", settings.admin_token, extra_headers=condition
+    )
+    assert r.status_code == 200

@@ -249,7 +249,7 @@ def serve(
     answers."""
     if records is not None and data_dir is not None:
         raise ValueError("serve() takes records to import or a data_dir already built, not both")
-    with tempfile.TemporaryDirectory() as scratch:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as scratch:
         if data_dir is None:
             data_dir = Path(scratch)
             if records is None:
