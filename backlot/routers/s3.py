@@ -1816,7 +1816,8 @@ def _configuration_list(q, selector: str) -> Response:
 
 # The query parameters an object's GET and HEAD set a response header with, and the header each one
 # sets, on the 200 and the 206 and not on a sub-resource's answer or a refusal (real S3, us-east-1,
-# measured 2026-10-11). The bytes, the ETag and the length stay the object's.
+# measured 2026-10-11). The bytes, the ETag and the length stay the object's. A 304 carries each
+# header but `Content-Type` (2026-10-13).
 _RESPONSE_HEADERS = {
     "response-content-type": "Content-Type",
     "response-content-language": "Content-Language",
@@ -1838,9 +1839,9 @@ def _response_override_refusal(q) -> Response | None:
     one holding a `"` that opens a quoted span it does not close, where a backslash escapes the
     character after it inside the quotes or out: `a"b` and `"a\\"` are refused, `"a"b` and `a\\"b`
     are not. Real S3 refused both ahead of a bucket or a key that does not exist, a `versionId`, a
-    `partNumber`, a `Range`, a checksum mode or a precondition it refuses, a sub-resource's answer
-    and an unsigned request's 400, and ahead of the credential in 30 of 32 requests whose signature
-    or key it refused (us-east-1, 2026-10-13).
+    `partNumber`, a `Range`, a checksum mode, a condition's 304 or 412, a sub-resource's answer and
+    an unsigned request's 400, and ahead of the credential in 30 of 32 requests whose signature or
+    key it refused (us-east-1, 2026-10-13).
     """
     for name in _RESPONSE_HEADERS:
         value = _first(q, name, None)
@@ -2015,18 +2016,21 @@ async def object_get(request: Request, bucket: str, key: str):
     last_modified = synth.s3_http_date(ts)
 
     # Conditional headers. Real S3 (us-east-1, 2026-10-11 and 2026-10-12) answers the 304 and the
-    # 412 ahead of the part-number refusal and the Range parse, GET and HEAD alike, but a bad
-    # checksum mode is refused ahead of both.
+    # 412 after a key's sub-resources, which read no condition, and ahead of the part-number refusal
+    # and the Range parse, GET and HEAD alike, but a bad checksum mode is refused ahead of both.
     verdict = _precondition(request, etag.strip('"'), _http_date(last_modified))
     if verdict is not None:
         if _checksum_mode(request) is None:
             return _head(400) if head else _error("InvalidRequest", _BAD_CHECKSUM_MODE)
         kind, condition = verdict
         if kind == "304":
-            # Only ETag and Last-Modified; the request-id pair comes from the /s3 middleware.
+            # ETag, Last-Modified and the overrides `_RESPONSE_HEADERS` puts on a 304; the
+            # request-id pair comes from the /s3 middleware.
+            carried = _response_overrides(q)
+            carried.pop("Content-Type", None)
             return Response(
                 status_code=304,
-                headers={"ETag": etag, "Last-Modified": last_modified},
+                headers={"ETag": etag, "Last-Modified": last_modified, **carried},
             )
         if head:
             return _head(412)
