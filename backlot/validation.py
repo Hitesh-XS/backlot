@@ -30,7 +30,7 @@ def _load_schemas() -> dict[str, dict]:
     """Load every ``*.schema.json`` in ``SCHEMA_DIR``, keyed by its ``source_type`` const."""
     schemas: dict[str, dict] = {}
     for p in sorted(SCHEMA_DIR.glob("*.schema.json")):
-        schema = json.loads(p.read_text(encoding="utf-8"))
+        schema = json.loads(p.read_text())
         const = schema.get("properties", {}).get("source_type", {}).get("const")
         schemas[const or p.name.split(".")[0]] = schema
     if not schemas:

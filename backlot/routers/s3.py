@@ -39,14 +39,13 @@ import hashlib
 import re
 import zlib
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 import xxhash
 from fastapi import APIRouter, Request, Response
 
-from backlot import auth, sigv4, store, synth
+from backlot import auth, sigv2, sigv4, store, synth
 from backlot.openapi import qp
 
 router = APIRouter(prefix="/s3", tags=["s3"])
@@ -475,40 +474,36 @@ _CONFIGURATION_LISTS = {
 # --------------------------------------------------------------------------- helpers
 
 
-def _etag_matches(header_value: str, etag: str) -> bool:
-    """Loose ETag match, as real S3 does it: comma list, optional W/ prefix,
-    optional quotes, case-sensitive; '*' matches. Empty matches nothing."""
-    for part in header_value.split(","):
-        part = part.strip()
-        if part == "*":
-            return True
-        if part.startswith("W/"):
-            part = part[2:]
-        part = part.strip().strip('"')
-        if part and part == etag:
-            return True
-    return False
+def _etag_matches(sent: list[str], etag: str) -> bool:
+    """Whether the values of an `If-Match` or an `If-None-Match`, every line of it, name an object
+    whose unquoted ETag is ``etag``, as real S3 matched them (us-east-1, 2026-10-13): split at each
+    `"`, `,`, space and tab, they match where a piece is the ETag, case and all, or `*`. So
+    `W/"<etag>"`, `w/"<etag>"`, `"*"`, `"0000" "<etag>"` and `"0000";"<etag>"` match, where
+    `W/<etag>`, `W/*`, `'<etag>'`, `"0000";<etag>` and an empty value do not."""
+    pieces = re.split(r'[", \t]+', ",".join(sent))
+    return etag in pieces or "*" in pieces
 
 
-def _http_date(value: str):
-    """Parse any of the three HTTP-date formats; None if unparseable (ignored)."""
+def _http_date(value: str) -> datetime | None:
+    """A condition's date as real S3 read an `If-Modified-Since` and an `If-Unmodified-Since`
+    (us-east-1, 2026-10-13), or ``None`` where it read none and left the condition out: as
+    ``sigv2.parse_date`` reads a `Date`, except that the ISO 8601 basic form an `x-amz-date` takes
+    is no date here, and neither is a year past 9999, which a `Date` is a 500 for."""
+    if value[:1].isdigit():
+        return None
     try:
-        dt = parsedate_to_datetime(value)
-    except (TypeError, ValueError, IndexError):
+        return sigv2.parse_date(value)
+    except sigv2.DateOutOfRange:
         return None
-    if dt is None:
-        return None
-    if dt.tzinfo is None:  # asctime format carries no zone
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
 
 
 def _precondition(request, etag: str, last_modified: datetime):
-    """Return ("412", condition_name), ("304", None) or None.
-    Order follows RFC 9110 section 13.2.2, which matches the measured rows."""
+    """Return ("412", condition_name), ("304", None) or None. Order follows RFC 9110 section
+    13.2.2, which matches the measured rows (us-east-1, 2026-10-11 to 2026-10-13). Every line of an
+    ETag condition is read, and the first line of a date."""
     h = request.headers
-    if_match = h.get("if-match")
-    if if_match is not None:
+    if_match = h.getlist("if-match")
+    if if_match:
         if not _etag_matches(if_match, etag):
             return ("412", "If-Match")
     else:
@@ -518,8 +513,8 @@ def _precondition(request, etag: str, last_modified: datetime):
             if d is not None and last_modified > d:
                 return ("412", "If-Unmodified-Since")
 
-    none_match = h.get("if-none-match")
-    if none_match is not None:
+    none_match = h.getlist("if-none-match")
+    if none_match:
         if _etag_matches(none_match, etag):
             return ("304", None)
     else:
@@ -1943,12 +1938,8 @@ async def object_get(request: Request, bucket: str, key: str):
     # checksum mode is refused ahead of both.
     verdict = _precondition(request, etag.strip('"'), _http_date(last_modified))
     if verdict is not None:
-        if _checksum_mode(request) == "invalid":
-            return (
-                _head(400)
-                if head
-                else _error("InvalidArgument", "The checksum mode header is invalid")
-            )
+        if _checksum_mode(request) is None:
+            return _head(400) if head else _error("InvalidRequest", _BAD_CHECKSUM_MODE)
         kind, condition = verdict
         if kind == "304":
             # Only ETag and Last-Modified; the request-id pair comes from the /s3 middleware.

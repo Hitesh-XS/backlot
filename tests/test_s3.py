@@ -542,6 +542,8 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
         ("DELETE", "/s3/people-vault/x.txt?tagging", 501),
         ("GET", "/s3/people-vault/comp/bands.csv", 200),
         ("HEAD", "/s3/people-vault/comp/bands.csv", 200),
+        ("GET", "/s3/people-vault/comp/bands.csv", 304, {"If-None-Match": "*"}),
+        ("HEAD", "/s3/people-vault/comp/bands.csv", 412, {"If-Match": '"0000"'}),
         ("HEAD", "/s3/people-vault", 200),
         ("GET", "/s3/people-vault/", 200),
         ("HEAD", "/s3/people-vault/", 200),
